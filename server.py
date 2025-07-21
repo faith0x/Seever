@@ -29,6 +29,8 @@ tracked_trades = []  # Store all trades for the tracked wallet
 logging.basicConfig(filename=LOG_FILE, level=logging.INFO, format='%(asctime)s - %(message)s')
 
 # Load or save trades to file
+last_processed_timestamp = 1752878130244  # July 19, 2025, ~00:00 UTC (before your data)
+
 def load_trades():
     if os.path.exists(TRADES_FILE):
         with open(TRADES_FILE, 'r') as f:
@@ -40,15 +42,23 @@ def save_trades():
         json.dump(tracked_trades, f, indent=2)
 
 # Fetch trades from Solana Tracker API
-def fetch_trades():
+def fetch_trades(min_timestamp):
     url = f'https://data.solanatracker.io/wallet/{TARGET_WALLET}/trades'
     headers = {'accept': 'application/json', 'X-API-KEY': API_KEY}
-    response = requests.get(url, headers=headers)
-    if response.status_code == 200:
-        return response.json()['trades']
-    else:
-        logging.error(f"Failed to fetch trades: {response.status_code}")
-        return []
+    all_trades = []
+    cursor = None
+    while True:
+        response = requests.get(url + (f"?cursor={cursor}" if cursor else ""), headers=headers)
+        if response.status_code != 200:
+            logging.error(f"Failed to fetch trades: {response.status_code}")
+            break
+        data = response.json()
+        trades = [t for t in data['trades'] if t['time'] >= min_timestamp]
+        all_trades.extend(trades)
+        if not data['hasNextPage'] or not trades:
+            break
+        cursor = data['nextCursor']
+    return all_trades
 
 # Fetch current price of a token
 def fetch_current_price(token_address):
@@ -153,6 +163,7 @@ def group_trades_by_token():
         token_trades[token_address].append(trade)
     return token_trades
 
+
 # Get status for tracked wallet
 def get_status():
     status = []
@@ -178,12 +189,8 @@ def get_status():
             "held_time": calculate_holding_time(first_buy_time, last_sell_time if amount_held <= 0 else None)
         }
         status.append(status_entry)
-    return {
-        "portfolio": status,
-        "simulated_sol_balance": round(my_sol_balance, 4),
-        "last_updated": datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")
-    }
-    
+    return {"portfolio": status, "last_updated": datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")}
+
 @app.route('/status', methods=['GET'])
 def status():
     return jsonify(get_status())
