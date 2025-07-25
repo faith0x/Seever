@@ -2,10 +2,14 @@ from flask import Flask, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
 import requests
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 import os
 import logging
+from pymongo import MongoClient
+
+price_cache = {}  # {token_address: (price, timestamp)}
+CACHE_EXPIRY = 300  # 5 minutes in seconds
 
 app = Flask(__name__)
 scheduler = BackgroundScheduler()
@@ -16,30 +20,38 @@ TARGET_WALLET = 'AJKgkQyHQBMK8MVkoKfp7qZo3VUMLiLszZV2WM9BhJgF'  # Your target wa
 MY_INITIAL_SOL = 2.0
 BUY_PERCENTAGE = 0.1  # Use 10% of current SOL balance per buy
 SELL_PERCENTAGE = 0.5  # Sell 50% of holdings per sell
-TRADES_FILE = 'trades.json'  # Store tracked wallet trades
-LOG_FILE = 'trading.log'  # Log file for simulated wallet
+LOG_FILE = 'trading.log'  # Log file for local testing
+ENV = os.getenv('ENV', 'local')  # 'local' or 'render'
+
+# MongoDB Configuration
+MONGO_URI = 'your_mongo_uri'  # Replace with your MongoDB URI
+client = MongoClient(MONGO_URI)
+db = client['trade_database']
+trades_collection = db['trades']
 
 # Simulated wallet state
 my_sol_balance = MY_INITIAL_SOL
-my_token_holdings = {}  # {token_address: {'amount': float, 'buy_price_usd': float, 'buy_time': int, 'total_bought_usd': float, 'total_sold_usd': float, 'pnl_usd': float, 'sold_time': int or None, 'name': str}}
-last_processed_timestamp = int(time.time() * 1000)  # Start from current time in milliseconds
-tracked_trades = []  # Store all trades for the tracked wallet
+my_token_holdings = {}  # {token_address: {'amount': float, 'buy_price_usd': float, 'buy_time': int, 'total_bought_usd': float, 'total_sold_usd': float, 'packed': float, 'sold_time': int or None, 'name': str}}
+last_processed_timestamp = int((datetime.now() - timedelta(hours=5)).timestamp() * 1000)
 
-# Setup logging
-logging.basicConfig(filename=LOG_FILE, level=logging.INFO, format='%(asctime)s - %(message)s')
+# Setup logging based on environment
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+formatter = logging.Formatter('%(asctime)s - %(message)s')
 
-# Load or save trades to file
-last_processed_timestamp = 1752878130244  # July 19, 2025, ~00:00 UTC (before your data)
-
-def load_trades():
-    if os.path.exists(TRADES_FILE):
-        with open(TRADES_FILE, 'r') as f:
-            return json.load(f)
-    return []
-
-def save_trades():
-    with open(TRADES_FILE, 'w') as f:
-        json.dump(tracked_trades, f, indent=2)
+if ENV == 'local':
+    # Local: Log to file and console with full details
+    file_handler = logging.FileHandler(LOG_FILE)
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+else:
+    # Render: Log to console only, limited details
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
 
 # Fetch trades from Solana Tracker API
 def fetch_trades(min_timestamp):
@@ -58,29 +70,61 @@ def fetch_trades(min_timestamp):
         if not data['hasNextPage'] or not trades:
             break
         cursor = data['nextCursor']
+    
+    fetch_time = datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")
+    if all_trades:
+        logging.info(f"Successfully fetched {len(all_trades)} trades at {fetch_time}")
+        if ENV == 'local':
+            for trade in all_trades:
+                logging.info(f"Fetched trade: {json.dumps(trade, indent=2)}")
+    else:
+        logging.info(f"No new trades fetched at {fetch_time}")
+    
     return all_trades
 
 # Fetch current price of a token
+# Fetch current price of a token with caching and retries
 def fetch_current_price(token_address):
+    current_time = time.time()
+    # Check cache first
+    if token_address in price_cache:
+        price, timestamp = price_cache[token_address]
+        if current_time - timestamp < CACHE_EXPIRY:
+            logging.info(f"Using cached price for {token_address}: {price}")
+            return price
+    
+    # Fetch from API with retry logic
     url = f'https://data.solanatracker.io/price?token={token_address}'
     headers = {'accept': 'application/json', 'X-API-KEY': API_KEY}
-    response = requests.get(url, headers=headers)
-    if response.status_code == 200:
-        return response.json()['price']
-    logging.error(f"Failed to fetch price for {token_address}: {response.status_code}")
-    return None
+    max_retries = 3
+    for attempt in range(max_retries):
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            price = response.json()['price']
+            price_cache[token_address] = (price, current_time)
+            logging.info(f"Fetched new price for {token_address}: {price}")
+            return price
+        elif response.status_code == 429:
+            logging.warning(f"Rate limit hit for {token_address}, attempt {attempt + 1}/{max_retries}")
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)  # Exponential backoff: 1s, 2s, 4s
+            continue
+        else:
+            logging.error(f"Failed to fetch price for {token_address}: {response.status_code}")
+            break
+    logging.error(f"All retries failed for {token_address}, using fallback")
+    return None  # Fallback to None if all retries fail
 
 # Simulate trades based on target wallet
 def simulate_trades():
-    global my_sol_balance, my_token_holdings, last_processed_timestamp, tracked_trades
-    trades = fetch_trades()
-    # Filter new trades
+    global my_sol_balance, my_token_holdings, last_processed_timestamp
+    trades = fetch_trades(last_processed_timestamp)
     new_trades = [trade for trade in trades if trade['time'] > last_processed_timestamp]
-    # Sort by timestamp for chronological processing
     new_trades = sorted(new_trades, key=lambda x: x['time'])
-    # Add new trades to tracked_trades
-    tracked_trades.extend(new_trades)
-    save_trades()
+    
+    # Store new trades in MongoDB
+    if new_trades:
+        trades_collection.insert_many(new_trades)
     
     for trade in new_trades:
         timestamp = trade['time']
@@ -116,6 +160,7 @@ def simulate_trades():
             # Sell trade
             token_address = trade['from']['address']
             token_name = trade['from']['token']['name']
+            # Rest of the sell logic...
             if token_address in my_token_holdings:
                 holding = my_token_holdings[token_address]
                 if holding['amount'] > 0:
@@ -132,14 +177,6 @@ def simulate_trades():
                     my_sol_balance += sell_value_sol
                     logging.info(f"Sold {sell_amount:.2f} of {token_name} ({token_address}) for {sell_value_sol:.4f} SOL, PNL: {pnl_usd:.2f} USD, SOL balance: {my_sol_balance:.4f}")
     
-    # Log PNL for holdings
-    sol_price_usd = fetch_current_price('So11111111111111111111111111111111111111112')
-    for token_address, holding in my_token_holdings.items():
-        if holding['amount'] > 0:
-            current_price_usd = fetch_current_price(token_address) or holding['buy_price_usd']
-            unrealized_pnl = (current_price_usd - holding['buy_price_usd']) * holding['amount']
-            logging.info(f"Unrealized PNL for {holding['name']} ({token_address}): {unrealized_pnl:.2f} USD, {unrealized_pnl / sol_price_usd:.4f} SOL")
-    
     if new_trades:
         last_processed_timestamp = max([trade['time'] for trade in new_trades])
         logging.info(f"Processed {len(new_trades)} new trades, last timestamp: {last_processed_timestamp}")
@@ -154,24 +191,27 @@ def calculate_holding_time(buy_time, sold_time=None):
     return f"{days}d {hours}h"
 
 # Group trades by token for status endpoint
-def group_trades_by_token():
+def group_trades_by_token(trades):
     token_trades = {}
-    for trade in tracked_trades:
+    for trade in trades:
         token_address = trade['to']['address'] if trade['from']['token']['symbol'] == 'SOL' else trade['from']['address']
         if token_address not in token_trades:
             token_trades[token_address] = []
         token_trades[token_address].append(trade)
     return token_trades
 
-
 # Get status for tracked wallet
 def get_status():
+    # Fetch all trades from MongoDB since last_processed_timestamp
+    tracked_trades = list(trades_collection.find({"time": {"$gte": int((datetime.now() - timedelta(hours=14)).timestamp() * 1000)}}))
     status = []
     sol_price_usd = fetch_current_price('So11111111111111111111111111111111111111112')
-    for token_address, trades in group_trades_by_token().items():
+    for token_address, trades in group_trades_by_token(tracked_trades).items():
         total_bought_usd = sum(t['volume']['usd'] for t in trades if t['from']['token']['symbol'] == 'SOL')
         total_sold_usd = sum(t['volume']['usd'] for t in trades if t['to']['token']['symbol'] == 'SOL')
         amount_held = sum(t['to']['amount'] for t in trades if t['from']['token']['symbol'] == 'SOL') - sum(t['from']['amount'] for t in trades if t['to']['token']['symbol'] == 'SOL')
+        if amount_held <= 0 and total_sold_usd == 0:
+            continue  # Skip fully sold trades with no activity
         first_buy_time = min(t['time'] for t in trades if t['from']['token']['symbol'] == 'SOL')
         last_sell_time = max((t['time'] for t in trades if t['to']['token']['symbol'] == 'SOL'), default=None)
         current_price_usd = fetch_current_price(token_address) or trades[0]['price']['usd']
@@ -196,7 +236,7 @@ def status():
     return jsonify(get_status())
 
 if __name__ == '__main__':
-    tracked_trades = load_trades()
-    scheduler.add_job(simulate_trades, 'interval', minutes=3)
+    logging.info("Starting the application...")
+    scheduler.add_job(simulate_trades, 'interval', minutes=3, next_run_time=datetime.now())
     scheduler.start()
     app.run(host='0.0.0.0', port=5000)
