@@ -24,7 +24,7 @@ LOG_FILE = 'trading.log'  # Log file for local testing
 ENV = os.getenv('ENV', 'local')  # 'local' or 'render'
 
 # MongoDB Configuration
-MONGO_URI = 'your_mongo_uri'  # Replace with your MongoDB URI
+MONGO_URI = 'mongodb+srv://goldminewithking:3pIavuGtWQ0Bm3kO@cluster0.rbme2u7.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0'  # Replace with your MongoDB URI
 client = MongoClient(MONGO_URI)
 db = client['trade_database']
 trades_collection = db['trades']
